@@ -530,8 +530,6 @@ class BatchLinearLHSFusion(BatchFusion):
             weight = get_arg_value(node, 1, "weight")
             bias = get_arg_value(node, 2, "bias")
             weight_val = weight.meta["example_value"]
-            # An empty projection adds no GEMM columns or fusion benefit, but
-            # grouping it with non-empty projections can change its eager stride.
             if not statically_known_true(weight_val.shape[0] > 0):
                 return None
             # Skip fusion when weight is a tensor subclass that can't handle aten.cat.
@@ -545,7 +543,7 @@ class BatchLinearLHSFusion(BatchFusion):
                     return None
             bias_tensor = None
             if bias is not None:
-                bias_tensor = bias.meta.get("example_value")
+                bias_tensor = bias.meta.get("val", bias.meta.get("example_value"))
                 if (
                     bias_tensor is None
                     or bias_tensor.ndim != 1
@@ -554,7 +552,8 @@ class BatchLinearLHSFusion(BatchFusion):
                     )
                 ):
                     return None
-            group_key = ("batch_linear_lhs", bias is not None, input)
+            bias_dim = None if bias_tensor is None else bias_tensor.ndim  # type: ignore[union-attr]
+            group_key = ("batch_linear_lhs", bias_dim, input)
         else:
             group_key = None
         return group_key
