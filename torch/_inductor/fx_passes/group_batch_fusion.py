@@ -554,8 +554,7 @@ class BatchLinearLHSFusion(BatchFusion):
                     )
                 ):
                     return None
-            bias_dim = None if bias_tensor is None else bias_tensor.ndim  # type: ignore[union-attr]
-            group_key = ("batch_linear_lhs", bias_dim, input)
+            group_key = ("batch_linear_lhs", bias is not None, input)
         else:
             group_key = None
         return group_key
