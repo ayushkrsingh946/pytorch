@@ -691,6 +691,10 @@ class TestGroupBatchFusion(TestCase):
             "contiguous_merge_view",
             "contiguous_output",
             "contiguous_as_strided_copy",
+            "contiguous_setitem",
+            "contiguous_inplace_relu",
+            "contiguous_higher_order",
+            "view_custom",
             "setitem",
             "view_setitem",
             "call_module",
@@ -752,6 +756,28 @@ class TestGroupBatchFusion(TestCase):
         def view_setitem(graph, node):
             view = split_view(graph, node)
             return graph.call_function(operator.setitem, args=(view, 0, 0))
+
+        def contiguous_setitem(graph, node):
+            copied = contiguous(graph, node)
+            return graph.call_function(operator.setitem, args=(copied, 0, 0))
+
+        def contiguous_inplace_relu(graph, node):
+            copied = contiguous(graph, node)
+            return graph.call_function(
+                torch.nn.functional.relu, args=(copied,), kwargs={"inplace": True}
+            )
+
+        def contiguous_higher_order(graph, node):
+            copied = contiguous(graph, node)
+            return graph.call_function(
+                triton_kernel_wrapper_mutation, kwargs={"kwargs": {"input": copied}}
+            )
+
+        def view_custom(graph, node):
+            return graph.call_function(
+                torch.ops._batch_linear_lhs_test.require_contiguous.default,
+                args=(split_view(graph, node),),
+            )
 
         def contiguous_as_strided_copy(graph, node):
             copied = contiguous(graph, node)
@@ -892,6 +918,10 @@ class TestGroupBatchFusion(TestCase):
             "contiguous_merge_view": contiguous_merge_view,
             "contiguous_output": contiguous_output,
             "contiguous_as_strided_copy": contiguous_as_strided_copy,
+            "contiguous_setitem": contiguous_setitem,
+            "contiguous_inplace_relu": contiguous_inplace_relu,
+            "contiguous_higher_order": contiguous_higher_order,
+            "view_custom": view_custom,
             "setitem": lambda graph, node: graph.call_function(
                 operator.setitem, args=(node, 0, 0)
             ),
@@ -1176,9 +1206,9 @@ class TestGroupBatchFusion(TestCase):
                 self.proj_b = torch.nn.Linear(64, 16, bias=False)
 
             def forward(self, x):
-                large = _require_contiguous(self.proj_large(x).contiguous())
-                a = _require_contiguous(self.proj_a(x).contiguous())
-                b = _require_contiguous(self.proj_b(x).contiguous())
+                large = torch.sin(self.proj_large(x).contiguous())
+                a = torch.sin(self.proj_a(x).contiguous())
+                b = torch.sin(self.proj_b(x).contiguous())
                 return torch.cat((large, a, b), dim=1)
 
         module = M().eval()
@@ -1195,11 +1225,29 @@ class TestGroupBatchFusion(TestCase):
 
             def forward(self, x):
                 large = self.large(x)
-                view = large.view(32, 4, 12)
-                view[0] = 0
+                large.contiguous()[0] = 0
                 return (
-                    torch.sin(view),
-                    torch.cos(large),
+                    torch.sin(large),
+                    torch.sin(self.a(x)),
+                    torch.cos(self.b(x)),
+                )
+
+        module = M().eval()
+        _check_lhs_fusion(self, module, [2], torch.randn(32, 64))
+
+    @_lhs_fusion_config
+    def test_batch_linear_lhs_skips_custom_op_after_view(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.large = torch.nn.Linear(64, 48, bias=False)
+                self.a = torch.nn.Linear(64, 16, bias=False)
+                self.b = torch.nn.Linear(64, 16, bias=False)
+
+            def forward(self, x):
+                view = self.large(x).view(32, 4, 12)
+                return (
+                    torch.ops._batch_linear_lhs_test.contiguous.default(view),
                     torch.sin(self.a(x)),
                     torch.cos(self.b(x)),
                 )

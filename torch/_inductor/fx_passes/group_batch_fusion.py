@@ -1043,9 +1043,7 @@ def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
         return False
     if op is not None:
         return op._schema.is_mutable
-    if isinstance(user.target, torch._ops.OpOverload):
-        return user.target._schema.is_mutable
-    return _is_mutable_node(user.target)
+    return True
 
 
 def _has_storage_sensitive_user(node: torch.fx.Node) -> bool:
@@ -1086,9 +1084,7 @@ def _has_mutable_alias_user(node: torch.fx.Node) -> bool:
     return False
 
 
-def _direct_layout_user_is_sensitive(
-    user: torch.fx.Node, op, behind_alias=False
-) -> bool:
+def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
     """Return True if fusing the producer would change this user's semantics.
 
     Fusion replaces a contiguous ``[M, N_i]`` linear output with
@@ -1111,12 +1107,6 @@ def _direct_layout_user_is_sensitive(
     if _is_conversion_user(user, op):
         return False
     if op is None:
-        if (
-            behind_alias
-            and isinstance(user.target, torch._ops.OpOverload)
-            and not user.target._schema.is_mutable
-        ):
-            return False
         return True
     if op._schema.is_mutable:
         return True
@@ -1178,7 +1168,7 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
-        elif _direct_layout_user_is_sensitive(user, op, behind_alias):
+        elif _direct_layout_user_is_sensitive(user, op):
             return _reject_layout(user)
         elif _is_aliasing_user(user, assume_alias=True):
             pending.extend((next_user, True) for next_user in user.users)
