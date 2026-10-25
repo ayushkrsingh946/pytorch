@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from torch._dynamo.utils import counters, is_node_meta_valid
+from torch._inductor.fx_utils import get_storage
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.symbolic_shapes import free_symbols, statically_known_true
@@ -959,32 +960,6 @@ def _contiguous_aliases(user: torch.fx.Node) -> bool:
     return _memory_format(user) in (None, torch.contiguous_format)
 
 
-def _target_is_mutable(target):
-    if isinstance(target, torch._ops.OpOverload):
-        return target._schema.is_mutable
-    return None
-
-
-def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
-    if user.op not in ("call_method", "call_function"):
-        return False
-    if user.op == "call_function" and user.target is operator.getitem:
-        return False
-    if op is not None:
-        if op._schema.is_mutable:
-            return True
-        return _is_mutable_node(user.target)
-    target_mutable = _target_is_mutable(user.target)
-    if target_mutable is not None:
-        return target_mutable
-    if user.op == "call_function":
-        # No resolvable schema: operator.setitem, HigherOrderOperator, or
-        # another opaque callable. Assume it may mutate rather than miss a
-        # write.
-        return True
-    return _is_mutable_node(user.target)
-
-
 def _allowed_alias(user: torch.fx.Node, op) -> bool:
     # Traversable alias: safe only when it cannot merge dimensions.
     if user.op == "call_function" and user.target is operator.getitem:
@@ -1006,7 +981,7 @@ def _allowed_alias(user: torch.fx.Node, op) -> bool:
 
 
 def _is_alias_of(source: torch.Tensor, result: torch.Tensor) -> bool:
-    return bool(torch._C._is_alias_of(source, result))  # type: ignore[attr-defined]
+    return get_storage(source) == get_storage(result)
 
 
 def _tensor_values(value):
@@ -1050,9 +1025,6 @@ def _is_aliasing_user(user: torch.fx.Node, assume_alias: bool = False) -> bool:
 
 _STORAGE_SENSITIVE_OPS = OrderedSet(
     [
-        # A row view such as b[1].contiguous() can read neighboring storage,
-        # and its storage offset differs from the copy. Keep this list in sync
-        # with the storage readers in _LAYOUT_SENSITIVE_OPS.
         "as_strided",
         "as_strided_copy",
         "storage_offset",
@@ -1062,6 +1034,18 @@ _STORAGE_SENSITIVE_OPS = OrderedSet(
         "_has_same_storage_numel",
     ]
 )
+
+
+def _direct_is_mutable(user: torch.fx.Node, op) -> bool:
+    if user.op not in ("call_method", "call_function"):
+        return False
+    if user.op == "call_function" and user.target is operator.getitem:
+        return False
+    if op is not None:
+        return op._schema.is_mutable
+    if isinstance(user.target, torch._ops.OpOverload):
+        return user.target._schema.is_mutable
+    return _is_mutable_node(user.target)
 
 
 def _has_storage_sensitive_user(node: torch.fx.Node) -> bool:
@@ -1102,7 +1086,9 @@ def _has_mutable_alias_user(node: torch.fx.Node) -> bool:
     return False
 
 
-def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
+def _direct_layout_user_is_sensitive(
+    user: torch.fx.Node, op, behind_alias=False
+) -> bool:
     """Return True if fusing the producer would change this user's semantics.
 
     Fusion replaces a contiguous ``[M, N_i]`` linear output with
@@ -1124,7 +1110,15 @@ def _direct_layout_user_is_sensitive(user: torch.fx.Node, op) -> bool:
         return False
     if _is_conversion_user(user, op):
         return False
-    if op is None or op._schema.is_mutable:
+    if op is None:
+        if (
+            behind_alias
+            and isinstance(user.target, torch._ops.OpOverload)
+            and not user.target._schema.is_mutable
+        ):
+            return False
+        return True
+    if op._schema.is_mutable:
         return True
     if op.namespace != "aten":
         return True
@@ -1184,7 +1178,7 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
             continue
         if _allowed_alias(user, op):
             pending.extend((next_user, True) for next_user in user.users)
-        elif _direct_layout_user_is_sensitive(user, op):
+        elif _direct_layout_user_is_sensitive(user, op, behind_alias):
             return _reject_layout(user)
         elif _is_aliasing_user(user, assume_alias=True):
             pending.extend((next_user, True) for next_user in user.users)
