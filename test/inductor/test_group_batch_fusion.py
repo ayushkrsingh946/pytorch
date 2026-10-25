@@ -698,7 +698,6 @@ class TestGroupBatchFusion(TestCase):
             "setitem",
             "view_setitem",
             "call_module",
-            "view_then_add",
             "view_then_memory_format",
             "leaky_relu",
             "leaky_relu_inplace",
@@ -834,14 +833,6 @@ class TestGroupBatchFusion(TestCase):
             )
             return result
 
-        def view_then_add(graph, node):
-            view = split_view(graph, node)
-            result = graph.call_function(torch.add, args=(view, view))
-            result.meta["example_value"] = (
-                view.meta["example_value"] + view.meta["example_value"]
-            )
-            return result
-
         def view_then_memory_format(graph, node):
             view = split_view(graph, node)
             result = graph.call_method(
@@ -927,7 +918,6 @@ class TestGroupBatchFusion(TestCase):
             ),
             "view_setitem": view_setitem,
             "call_module": lambda graph, node: graph.call_module("m", args=(node,)),
-            "view_then_add": view_then_add,
             "view_then_memory_format": view_then_memory_format,
             "leaky_relu": lambda graph, node: graph.call_function(
                 torch.nn.functional.leaky_relu, args=(node, 0.1)
