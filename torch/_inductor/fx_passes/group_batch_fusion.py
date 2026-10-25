@@ -13,8 +13,9 @@ from torch._inductor.fx_utils import get_storage
 from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.symbolic_shapes import free_symbols, statically_known_true
-from torch.fx.operator_schemas import normalize_function
+from torch.fx.operator_schemas import get_signature_for_torch_op, normalize_function
 from torch.fx.passes.graph_transform_observer import GraphTransformObserver
+from torch.utils._inspect import _fast_bind
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
@@ -22,6 +23,7 @@ from ..pattern_matcher import (
     CallFunctionVarArgs,
     CallMethodVarArgs,
     get_arg_value,
+    is_mutation_op,
     MatchResult,
     stable_topological_sort,
 )
@@ -760,11 +762,6 @@ _LAYOUT_INDEPENDENT_OPS = OrderedSet(
         "layer_norm",
         "native_layer_norm",
         "rms_norm",
-        "scaled_dot_product_attention",
-        "scaled_dot_product_flash_attention",
-        "scaled_dot_product_efficient_attention",
-        "scaled_dot_product_cudnn_attention",
-        "_scaled_dot_product_attention_math",
         "log_softmax",
         "amax",
         "amin",
@@ -845,8 +842,8 @@ def _layout_user_overloads(user: torch.fx.Node):
     if isinstance(target, torch._ops.OpOverload):
         return target if target.namespace == "aten" else None
     if isinstance(target, torch._ops.OpOverloadPacket):
-        qualname = target._qualified_op_name
         packet = target
+        namespace = packet._qualified_op_name.partition("::")[0]
     else:
         qualname = torch.jit._builtins._find_builtin(target)
         if qualname is None:
@@ -855,13 +852,30 @@ def _layout_user_overloads(user: torch.fx.Node):
         packet = getattr(getattr(torch.ops, namespace, None), op_name, None)
         if not isinstance(packet, torch._ops.OpOverloadPacket):
             return None
-    args, kwargs = torch.fx.node.map_arg((args, kwargs), _node_value)
-    try:
-        overload_name = torch._C._jit_resolve_packet(qualname, *args, **kwargs)
-    except RuntimeError:
+    if namespace != "aten":
         return None
-    overload = getattr(packet, overload_name, None)
-    return overload if overload is not None and overload.namespace == "aten" else None
+    signatures, schemas = get_signature_for_torch_op(packet, return_schemas=True)
+    if not signatures or not schemas:
+        return None
+    matched = []
+    for signature, schema in zip(signatures, schemas):
+        try:
+            _fast_bind(signature, *args, **kwargs)
+        except TypeError:
+            continue
+        matched.append(schema)
+    if not matched:
+        return None
+    ops = []
+    for schema in matched:
+        overload = getattr(packet, schema.overload_name or "default", None)
+        if overload is not None and overload.namespace == "aten":
+            ops.append(overload)
+    if not ops:
+        return None
+    return next(
+        (overload for overload in ops if torch.Tag.pointwise in overload.tags), ops[0]
+    )
 
 
 def _shape_value(value):
@@ -981,6 +995,8 @@ def _allowed_alias(user: torch.fx.Node, op) -> bool:
 
 
 def _is_alias_of(source: torch.Tensor, result: torch.Tensor) -> bool:
+    if not torch._C._has_storage(source) or not torch._C._has_storage(result):
+        return False
     return get_storage(source) == get_storage(result)
 
 
@@ -1175,22 +1191,6 @@ def _has_layout_sensitive_user(node: torch.fx.Node) -> bool:
     return False
 
 
-# Poor person's check for if a node in the graph mutates its input.
-# (the graph is torch IR, so we will see torch fns and python operators)
-def _is_mutable_node(tgt):
-    if str(tgt).endswith("_"):
-        # e.g. torch.mul_, torch.Tensor.mul_
-        return True
-    if (
-        hasattr(tgt, "__module__")
-        and tgt.__module__ == "_operator"
-        and tgt.__name__.startswith("i")
-    ):
-        # e.g. operator.iand, operator.imul
-        return True
-    return False
-
-
 def is_linear_node_can_be_fused(node: torch.fx.Node):
     input = get_arg_value(node, 0, "input")
     weight = get_arg_value(node, 1, "weight")
@@ -1203,7 +1203,7 @@ def is_linear_node_can_be_fused(node: torch.fx.Node):
         # the mm -> bmm transform adds an unbind() op,
         # which is not safe for autograd when the output of the mm is mutated.
         # don't pattern match if any users of the mm mutate the input.
-        and not any(_is_mutable_node(user.target) for user in node.users)
+        and not any(is_mutation_op(user) for user in node.users)
     )
 
 
