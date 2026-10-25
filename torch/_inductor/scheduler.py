@@ -5980,6 +5980,11 @@ class Scheduler:
         # all subsequent uses of buf0 become buf1's usage in dependency graph
         self.mutation_real_name: dict[str, str] = {}
 
+        # inplace_cat_writes: maps a cat input realized in place into a slice of
+        # a ConcatKernel buffer to that cat buffer, e.g. {"buf3": "buf5"}. Kept
+        # out of read_writes so fusion and memory heuristics are unaffected.
+        self.inplace_cat_writes: dict[str, str] = {}
+
         # We handle mutation by renaming modified versions of the same
         # buffer in the dependency graph to prevent cycles.
         # mutation_renames: tracks the current name for a given buffer
@@ -6673,6 +6678,14 @@ class Scheduler:
                                 )
                             )
                             add_user(other_name, node, is_weak=True)
+
+            for buf in node.get_outputs():
+                for alias in buf.get_aliases():
+                    alias_buf = self.name_to_buf.get(alias)
+                    if alias_buf is not None and isinstance(
+                        alias_buf.node, ir.ConcatKernel
+                    ):
+                        self.inplace_cat_writes[buf.get_name()] = alias
 
             for add_dep in V.graph.additional_buffer_deps[node.get_name()]:
                 add_user(add_dep, node, is_weak=True)
@@ -12036,13 +12049,37 @@ class Scheduler:
 
             return False
 
-        for partition, skip_cudagraph in zip(
-            reversed(partitions), reversed(skip_cudagraphs)
+        # cat inputs write the cat buffer in place, possibly in partitions before
+        # the ConcatKernel node. The first partition that writes it defines it.
+        cat_writes = [
+            OrderedSet(
+                self.inplace_cat_writes[name]
+                for node in partition
+                for name in node.get_buffer_names()
+                if name in self.inplace_cat_writes
+            )
+            for partition in partitions
+        ]
+        cat_owner: dict[str, int] = {}
+        for idx, names in enumerate(cat_writes):
+            for name in names:
+                cat_owner.setdefault(name, idx)
+
+        for idx, partition, skip_cudagraph in zip(
+            reversed(range(len(partitions))),
+            reversed(partitions),
+            reversed(skip_cudagraphs),
         ):
             output_names: OrderedSet[str] = OrderedSet()
 
             for node in partition:
                 output_names.update(node.outputs_by_name.keys())
+
+            output_names = OrderedSet(
+                name
+                for name in output_names | cat_writes[idx]
+                if cat_owner.get(name, idx) == idx
+            )
 
             returned_output_names = output_names.intersection(unmet_output_names)
 
@@ -12055,8 +12092,9 @@ class Scheduler:
             # WeakDep is fake dependency on unused buffer. It should not appear
             # in partition_input_names for inputs that are actually read or written.
             partition_input_names = (
-                _real_dep_names(read_writes.reads | read_writes.writes) - output_names
-            )
+                _real_dep_names(read_writes.reads | read_writes.writes)
+                | cat_writes[idx]
+            ) - output_names
 
             partition_input_names = OrderedSet(
                 self.mutation_real_name.get(name, name)
